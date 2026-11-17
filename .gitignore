@@ -27,3 +27,6 @@ target/
 __pycache__/
 .DS_Store
 *.log
+# Spark write markers and checksums, wherever a run is exported
+_SUCCESS
+*.crc

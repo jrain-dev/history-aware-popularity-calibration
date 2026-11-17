@@ -14,6 +14,19 @@ import matplotlib.pyplot as plt
 METRICS = ("upd", "precision", "recall", "ndcg")
 GROUP_KEYS = ("setting", "method", "lambda", "n0", "groupType", "group")
 
+# Matched-UPD gains are estimates, not measurements: calibration results.csv holds validation metrics for a
+# handful of sampled settings per method, and the gain at a given UPD comes from linear interpolation between
+# them, restricted to the UPD range both CP and HA reach. These labels travel with every reported row.
+MATCHED_UPD_BASIS = (
+    "validation estimate; linear interpolation between sampled settings within the overlapping "
+    "CP/HA UPD range; not measured at identical UPD"
+)
+NO_OVERLAP_BASIS = "no overlapping CP/HA UPD range; gain not estimated (not zero)"
+MATCHED_UPD_FOOTNOTE = (
+    "Validation data. Gains are linear interpolations between sampled settings over each pair's overlapping "
+    "UPD range, not measurements at identical UPD; groups without overlap are not estimated."
+)
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
@@ -132,6 +145,7 @@ def matched_gain_by_seed(data, groups, n0_values):
                     "min_gain": np.nan,
                     "max_gain": np.nan,
                     "share_grid_ha_better": np.nan,
+                    "basis": NO_OVERLAP_BASIS,
                 }
                 if low < high:
                     grid = np.linspace(low, high, 50)
@@ -142,39 +156,56 @@ def matched_gain_by_seed(data, groups, n0_values):
                         min_gain=float(differences.min()),
                         max_gain=float(differences.max()),
                         share_grid_ha_better=float((differences > 0).mean()),
+                        basis=MATCHED_UPD_BASIS,
                     )
                 rows.append(row)
     return pd.DataFrame(rows)
 
 
 def summarize_matched_gain(per_seed):
-    valid = per_seed.dropna(subset=["mean_ndcg_gain"])
-    if valid.empty:
-        return pd.DataFrame(
-            columns=[
-                "groupType",
-                "group",
-                "n0",
-                "overlap",
-                "mean_ndcg_gain",
-                "std_ndcg_gain",
-                "seeds_ha_better",
-                "seedCount",
-            ]
-        )
-    summary = (
-        valid.groupby(["groupType", "group", "n0"], dropna=False)
-        .agg(
-            overlap=("overlap", lambda values: ";".join(sorted(set(values)))),
-            mean_ndcg_gain=("mean_ndcg_gain", "mean"),
-            std_ndcg_gain=("mean_ndcg_gain", lambda values: values.std(ddof=1)),
-            seeds_ha_better=("mean_ndcg_gain", lambda values: int((values > 0).sum())),
-            seedCount=("seed", "nunique"),
-        )
-        .reset_index()
-    )
-    summary["std_ndcg_gain"] = summary["std_ndcg_gain"].fillna(0.0)
-    return summary
+    """Aggregate per-seed gains, keeping groups without CP/HA overlap as explicit "not estimated" rows."""
+    columns = [
+        "groupType",
+        "group",
+        "n0",
+        "overlap",
+        "mean_ndcg_gain",
+        "std_ndcg_gain",
+        "seeds_ha_better",
+        "seedsWithOverlap",
+        "seedCount",
+        "basis",
+    ]
+    rows = []
+    for (group_type, group, n0), subset in per_seed.groupby(["groupType", "group", "n0"], sort=True):
+        valid = subset.dropna(subset=["mean_ndcg_gain"])
+        seed_count = subset.seed.nunique()
+        with_overlap = valid.seed.nunique()
+        row = {
+            "groupType": group_type,
+            "group": group,
+            "n0": n0,
+            "overlap": ";".join(sorted(set(subset.overlap))),
+            "mean_ndcg_gain": np.nan,
+            "std_ndcg_gain": np.nan,
+            "seeds_ha_better": np.nan,
+            "seedsWithOverlap": with_overlap,
+            "seedCount": seed_count,
+            "basis": NO_OVERLAP_BASIS,
+        }
+        if with_overlap:
+            gains = valid.mean_ndcg_gain
+            row.update(
+                mean_ndcg_gain=float(gains.mean()),
+                # One estimate has no spread; report 0 as before (documented as zero for a single input).
+                std_ndcg_gain=float(gains.std(ddof=1)) if with_overlap > 1 else 0.0,
+                seeds_ha_better=int((gains > 0).sum()),
+                basis=MATCHED_UPD_BASIS
+                if with_overlap == seed_count
+                else f"{MATCHED_UPD_BASIS}; averaged over the {with_overlap} of {seed_count} seeds with overlap",
+            )
+        rows.append(row)
+    return pd.DataFrame(rows, columns=columns)
 
 
 def main():
@@ -224,7 +255,9 @@ def main():
     for axis in axes[len(groups) :]:
         axis.set_visible(False)
     axes[0].legend()
-    figure.suptitle("Mean relevance vs popularity alignment across split seeds (error bars = 1 SD)")
+    figure.suptitle(
+        "Validation NDCG@10 vs UPD by group, from calibration results.csv (error bars = 1 SD across seeds)"
+    )
     figure.tight_layout()
     figure.savefig(os.path.join(output_dir, "ndcg_vs_upd.png"), dpi=150)
     plt.close(figure)
@@ -243,32 +276,44 @@ def main():
         figure, axis = plt.subplots(figsize=(7, 4))
         for index, n0 in enumerate(n0s):
             rows = history[history.n0 == n0].set_index("group").reindex(buckets)
+            bar_positions = positions + (index - (len(n0s) - 1) / 2) * width
             axis.bar(
-                positions + (index - (len(n0s) - 1) / 2) * width,
+                bar_positions,
                 rows["mean_ndcg_gain"],
                 width,
                 yerr=rows["std_ndcg_gain"],
                 capsize=3,
                 label=f"N0={n0}",
             )
+            # A missing bar would read as a zero gain; label it as not estimated instead.
+            for position, gain in zip(bar_positions, rows["mean_ndcg_gain"]):
+                if pd.isna(gain):
+                    axis.text(position, 0, "no UPD\noverlap", ha="center", va="bottom", fontsize=7)
         axis.axhline(0, color="k", lw=0.8)
         axis.set_xticks(positions, buckets)
-        axis.set_ylabel("Mean NDCG@10 gain over CP at equal UPD")
+        axis.set_ylabel("Interpolated NDCG@10 gain over CP\nat matched UPD (validation)")
         axis.set_xlabel("History bucket")
-        axis.set_title("History-aware vs fixed CP (error bars = 1 SD)")
+        axis.set_title("History-aware vs fixed CP on validation (error bars = 1 SD across seeds)")
         axis.legend()
-        figure.tight_layout()
+        figure.text(0.01, 0.01, MATCHED_UPD_FOOTNOTE, fontsize=7, wrap=True, va="bottom")
+        figure.tight_layout(rect=(0, 0.08, 1, 1))
         figure.savefig(os.path.join(output_dir, "gain_by_history_bucket.png"), dpi=150)
         plt.close(figure)
 
-        print("\nMatched-UPD NDCG@10 gain by history bucket (mean +/- SD):")
+        print("\nMatched-UPD NDCG@10 gain by history bucket on validation (mean +/- SD):")
+        print(f"Note: {MATCHED_UPD_FOOTNOTE}")
         print(
-            history[["n0", "group", "mean_ndcg_gain", "std_ndcg_gain", "seeds_ha_better", "seedCount"]]
+            history[
+                ["n0", "group", "overlap", "mean_ndcg_gain", "std_ndcg_gain", "seeds_ha_better", "seedsWithOverlap", "seedCount"]
+            ]
             .sort_values(["n0", "group"])
             .round(5)
             .to_string(index=False)
         )
-        print("seeds_ha_better counts splits where the per-seed matched-UPD mean gain is positive.")
+        print(
+            "seeds_ha_better counts splits where the per-seed matched-UPD mean gain is positive; "
+            "NaN gains mean no overlapping UPD range, not zero gain."
+        )
 
     print(f"\nAveraged {data.seed.nunique()} split seed(s) from {len(input_paths)} results file(s).")
     print(f"Outputs written to {output_dir}")
